@@ -80,14 +80,15 @@ func emptyMetaData() *PhoneMetadata {
 func getMetadataForRegionCode(regionCode string) *PhoneMetadata {
     countryCallingCode := GetCountryCodeForRegion(regionCode)
     mainCountry := GetRegionCodeForCountryCode(countryCallingCode)
-    return getMetadataForRegion(mainCountry)
+    metadata := getMetadataForRegion(mainCountry)
+    if metadata == nil {
+        return emptyMetaData()
+    }
+    return metadata
 }
 
 func NewAsYouTypeFormatter(regionCode string) *AsYouTypeFormatter {
     metadata := getMetadataForRegionCode(regionCode)
-    if metadata == nil {
-        metadata = emptyMetaData()
-    }
 
     return &AsYouTypeFormatter{
         defaultCountry: regionCode,
@@ -228,8 +229,8 @@ func (f *AsYouTypeFormatter) getAvailableFormats(leadingDigits string) {
 
     for _,format := range formatList {
         if len(f.extractedNationalPrefix) > 0 &&
-           formattingRuleHasFirstGroupOnly(*format.NationalPrefixFormattingRule) &&
-           !*format.NationalPrefixOptionalWhenFormatting &&
+           format.NationalPrefixFormattingRule != nil && formattingRuleHasFirstGroupOnly(*format.NationalPrefixFormattingRule) &&
+           format.NationalPrefixOptionalWhenFormatting != nil && !*format.NationalPrefixOptionalWhenFormatting &&
            format.DomesticCarrierCodeFormattingRule == nil {
             // If it is a national number that had a national prefix, any rules that aren't valid with a
             // national prefix should be excluded. A rule that has a carrier-code formatting rule is
