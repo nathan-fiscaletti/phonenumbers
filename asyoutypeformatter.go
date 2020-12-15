@@ -29,7 +29,7 @@ const(
 // prevents invalid punctuation (such as the star sign in Israeli star numbers) getting into the
 // output of the AYTF.
 var ELIGIBLE_FORMAT_PATTERN = regexp.MustCompile(
-    fmt.Sprintf("[%s]*(\\$\\d[%s]*)+", VALID_PUNCTUATION, VALID_PUNCTUATION),
+    "[" + VALID_PUNCTUATION + "]*" + "(\\$\\d" + "[" + VALID_PUNCTUATION + "]*)+",
 )
 
 // A set of characters that, if found in a national prefix formatting rules, are an indicator to
@@ -68,16 +68,25 @@ type AsYouTypeFormatter struct {
     possibleFormats []*NumberFormat
 }
 
+func emptyMetaData() *PhoneMetadata {
+    var ignored string = "<ignored>"
+    var ipfx string = "NA"
+    return &PhoneMetadata{
+        Id: &ignored,
+        InternationalPrefix: &ipfx,
+    }
+}
+
 func getMetadataForRegionCode(regionCode string) *PhoneMetadata {
     countryCallingCode := GetCountryCodeForRegion(regionCode)
     mainCountry := GetRegionCodeForCountryCode(countryCallingCode)
     return getMetadataForRegion(mainCountry)
 }
 
-func NewAsYouTypeFormatter(regionCode string) (*AsYouTypeFormatter, error) {
+func NewAsYouTypeFormatter(regionCode string) *AsYouTypeFormatter {
     metadata := getMetadataForRegionCode(regionCode)
     if metadata == nil {
-        return nil,fmt.Errorf("failed to retrieve meta data for region: %s", regionCode)
+        metadata = emptyMetaData()
     }
 
     return &AsYouTypeFormatter{
@@ -87,12 +96,13 @@ func NewAsYouTypeFormatter(regionCode string) (*AsYouTypeFormatter, error) {
         numberFormat: &NumberFormat{},
         possibleFormats: []*NumberFormat{},
         currentFormattingPattern: "",
+        ableToFormat: true,
         formattingTemplate: NewBuilderString(""),
         nationalNumber: NewBuilderString(""),
         accruedInput: NewBuilderString(""),
         accruedInputWithoutFormatting: NewBuilderString(""),
         prefixBeforeNationalNumber: NewBuilderString(""),
-    }, nil
+    }
 }
 
 func (f *AsYouTypeFormatter) InputDigit(nextChar rune) string {
@@ -105,8 +115,24 @@ func (f *AsYouTypeFormatter) InputDigitAndRememberPosition(nextChar rune) string
     return f.currentOutput
 }
 
-func (f *AsYouTypeFormatter) Clear() {
+func (f *AsYouTypeFormatter) GetExtractedNationalPrefix() string {
+    return f.extractedNationalPrefix
+}
 
+func (f *AsYouTypeFormatter) GetRememberedPosition() int {
+    if !f.ableToFormat {
+        return f.origingalPosition
+    }
+
+    accruedInputIndex := 0
+    currentOutputIndex := 0
+    for accruedInputIndex < f.positionToRemember && currentOutputIndex < len(f.currentOutput) {
+       if f.accruedInputWithoutFormatting.String()[accruedInputIndex] == f.currentOutput[currentOutputIndex] {
+           accruedInputIndex++
+       }
+       currentOutputIndex++
+    }
+    return currentOutputIndex
 }
 
 func (f *AsYouTypeFormatter) inputDigitWithOptionToRememberPosition(nextChar rune, rememberPosition bool) string {
@@ -124,7 +150,7 @@ func (f *AsYouTypeFormatter) inputDigitWithOptionToRememberPosition(nextChar run
         nextChar = f.normalizeAndAccrueDigitsAndPlusSign(nextChar, rememberPosition)
     }
 
-    if f.ableToFormat {
+    if !f.ableToFormat {
         // When we are unable to format because of reasons other than that formatting chars have been
         // entered, it can be due to really long IDDs or NDDs. If that is the case, we might be able
         // to do formatting again after extracting them.
@@ -202,8 +228,8 @@ func (f *AsYouTypeFormatter) getAvailableFormats(leadingDigits string) {
 
     for _,format := range formatList {
         if len(f.extractedNationalPrefix) > 0 &&
-           (format.NationalPrefixFormattingRule == nil || formattingRuleHasFirstGroupOnly(*format.NationalPrefixFormattingRule)) &&
-           (format.NationalPrefixOptionalWhenFormatting == nil || !*format.NationalPrefixOptionalWhenFormatting) &&
+           formattingRuleHasFirstGroupOnly(*format.NationalPrefixFormattingRule) &&
+           !*format.NationalPrefixOptionalWhenFormatting &&
            format.DomesticCarrierCodeFormattingRule == nil {
             // If it is a national number that had a national prefix, any rules that aren't valid with a
             // national prefix should be excluded. A rule that has a carrier-code formatting rule is
@@ -212,16 +238,16 @@ func (f *AsYouTypeFormatter) getAvailableFormats(leadingDigits string) {
             continue
         } else if len(f.extractedNationalPrefix) == 0 &&
                      !f.isCompleteNumber &&
-                     !(format.NationalPrefixFormattingRule == nil || formattingRuleHasFirstGroupOnly(*format.NationalPrefixFormattingRule)) &&
-                     (format.NationalPrefixOptionalWhenFormatting == nil || !*format.NationalPrefixOptionalWhenFormatting) {
+                     format.NationalPrefixFormattingRule != nil && !formattingRuleHasFirstGroupOnly(*format.NationalPrefixFormattingRule) &&
+                     !*format.NationalPrefixOptionalWhenFormatting {
             // This number was entered without a national prefix, and this formatting rule requires one,
             // so we discard it.
             continue
         }
 
-       if ELIGIBLE_FORMAT_PATTERN.MatchString(format.GetFormat()) {
-           f.possibleFormats = append(f.possibleFormats, format)
-       }
+        if ELIGIBLE_FORMAT_PATTERN.MatchString(format.GetFormat()) {
+            f.possibleFormats = append(f.possibleFormats, format)
+        }
     }
 
     f.narrowDownPossibleFormats(leadingDigits)
@@ -245,7 +271,9 @@ func (f *AsYouTypeFormatter) narrowDownPossibleFormats(leadingDigits string) {
             output_index++
         }
     }
-    f.possibleFormats = f.possibleFormats[:output_index]
+    if output_index != 0 {
+        f.possibleFormats = f.possibleFormats[:output_index]
+    }
 }
 
 // Returns true if a new template is created as opposed to reusing the existing template.
@@ -305,8 +333,10 @@ func (f *AsYouTypeFormatter) getFormattingTemplate(numberPattern string, numberF
     // Creates a phone number consisting only of the digit 9 that matches the
     // numberPattern by applying the pattern to the longestPhoneNumber string.
     longestPhoneNumber := "999999999999999"
-
-    aPhoneNumber := regexFor(numberPattern).FindString(longestPhoneNumber)
+    
+    pattern := regexFor(numberPattern)
+    _, start, end := regexFind(pattern, longestPhoneNumber, 0)
+    aPhoneNumber := longestPhoneNumber[start:end]
 
     // No formatting template can be created if the number of digits entered so far is longer than
     // the maximum the current formatting rule can accommodate.
@@ -337,11 +367,11 @@ func (f *AsYouTypeFormatter) normalizeAndAccrueDigitsAndPlusSign(nextChar rune, 
         normalizedChar = nextChar
         f.accruedInputWithoutFormatting.WriteRune(nextChar)
     } else {
+        normalizedChar = nextChar
         // radix := 10
         // normalizedChar = Character.forDigit(Character.digit(nextChar, radix), radix);
         // accruedInputWithoutFormatting.append(normalizedChar);
-        normalizedChar = nextChar
-        f.accruedInputWithoutFormatting.WriteRune(nextChar)
+        f.accruedInputWithoutFormatting.WriteRune(normalizedChar)
         f.nationalNumber.WriteRune(normalizedChar)
     }
 
@@ -408,7 +438,7 @@ func (f *AsYouTypeFormatter) attemptToExtractCountryCallingCode() bool {
 
     countryCodeString := fmt.Sprintf("%v", countryCode)
     f.prefixBeforeNationalNumber.WriteString(countryCodeString)
-    f.prefixBeforeNationalNumber.WriteString(string(SEPARATOR_BEFORE_NATIONAL_NUMBER))
+    f.prefixBeforeNationalNumber.WriteRune(SEPARATOR_BEFORE_NATIONAL_NUMBER)
 
     // When we have successfully extracted the IDD, the previously extracted NDD should be cleared
     // because it is no longer valid.
@@ -445,9 +475,9 @@ func (f *AsYouTypeFormatter) attemptToChooseFormattingPattern() string {
 
         if f.maybeCreateNewTemplate() {
             return f.inputAccruedNationalNumber()
-        } else {
-            return f.accruedInput.String()
         }
+
+        return f.accruedInput.String()
     }
 
     return f.appendNationalNumber(f.nationalNumber.String())
@@ -461,7 +491,7 @@ func (f *AsYouTypeFormatter) attemptToFormatAccruedDigits() string {
     for _,numberFormat := range f.possibleFormats {
         m := regexFor(numberFormat.GetPattern())
         if m.MatchString(f.nationalNumber.String()) {
-            f.shouldAddSpaceAfterNationalPrefix = NATIONAL_PREFIX_SEPARATORS_PATTERN.MatchString(numberFormat.GetNationalPrefixFormattingRule())
+            f.shouldAddSpaceAfterNationalPrefix, _, _ = regexFind(NATIONAL_PREFIX_SEPARATORS_PATTERN, numberFormat.GetNationalPrefixFormattingRule(), 0)
             formattedNumber := m.ReplaceAllString(f.nationalNumber.String(), numberFormat.GetFormat())
             // Check that we did not remove nor add any extra digits when we matched
             // this formatting pattern. This usually happens after we entered the last
@@ -471,7 +501,7 @@ func (f *AsYouTypeFormatter) attemptToFormatAccruedDigits() string {
             // in that way.
             fullOutput := f.appendNationalNumber(formattedNumber)
             formattedNumberDigitsOnly := normalizeDiallableCharsOnly(fullOutput)
-            if formattedNumberDigitsOnly == f.accruedInputWithoutFormatting.String() {
+            if strings.Contains(formattedNumberDigitsOnly, f.accruedInputWithoutFormatting.String()) {
                 return fullOutput
             }
         }
@@ -520,12 +550,36 @@ func (f *AsYouTypeFormatter) inputAccruedNationalNumber() string {
     return f.prefixBeforeNationalNumber.String()
 }
 
+func (f *AsYouTypeFormatter) Clear() {
+    f.currentOutput = ""
+    f.accruedInput.Reset()
+    f.accruedInputWithoutFormatting.Reset()
+    f.formattingTemplate.Reset()
+    f.lastMatchPosition = 0
+    f.currentFormattingPattern = ""
+    f.prefixBeforeNationalNumber.Reset()
+    f.extractedNationalPrefix = ""
+    f.nationalNumber.Reset()
+    f.ableToFormat = true
+    f.inputHasFormatting = false
+    f.positionToRemember = 0
+    f.origingalPosition = 0
+    f.isCompleteNumber = false
+    f.isExpectingCountryCallingCode = false
+    f.possibleFormats = []*NumberFormat{}
+    f.shouldAddSpaceAfterNationalPrefix = false
+    if f.currentMetadata == f.defaultMetadata {
+        f.currentMetadata = getMetadataForRegionCode(f.defaultCountry)
+    }
+}
+
 func (f *AsYouTypeFormatter) inputDigitHelper(nextChar rune) string {
     // Note that formattingTemplate is not guaranteed to have a value, it could be empty, e.g.
     // when the next digit is entered after extracting an IDD or NDD.
-    found, start, _ := regexFind(DIGIT_PATTERN, f.formattingTemplate.String(), f.lastMatchPosition)
+    found, _, _ := regexFind(DIGIT_PATTERN, f.formattingTemplate.String(), f.lastMatchPosition)
     if found {
         tempTemplate := f.formattingTemplate.String()
+        start := DIGIT_PATTERN.FindStringIndex(tempTemplate)[0]
         found := DIGIT_PATTERN.FindString(tempTemplate)
         if found != "" {
             tempTemplate = strings.Replace(tempTemplate, found, string(nextChar), 1)
@@ -605,7 +659,7 @@ func (f *AsYouTypeFormatter) isNanpaNumberWithNationalPrefix() bool {
     // that national significant numbers in NANPA always start with [2-9] after the national prefix.
     // Numbers beginning with 1[01] can only be short/emergency numbers, which don't need the
     // national prefix.
-    return f.currentMetadata.GetCountryCode() == 1 && f.nationalNumber.String()[0] == '1' && f.nationalNumber.String()[1] != '0' && f.nationalNumber.String()[1] != '1'
+    return f.currentMetadata.GetCountryCode() == 1 && f.nationalNumber.Len() > 0 && f.nationalNumber.String()[0] == '1' && f.nationalNumber.Len() > 2 && f.nationalNumber.String()[1] != '0' && f.nationalNumber.String()[1] != '1'
 }
 
 func regexFind(pattern *regexp.Regexp, stringToFind string, startIdx int) (bool, int, int) {
